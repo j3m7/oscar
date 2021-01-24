@@ -1,0 +1,15 @@
+
+## Globals section
+global:
+    high_temp_coefficient: 1.2     # Coefficient used when a sensor hits the high range.
+    head_decay_coefficient: .8     #
+
+sensors:
+  TA0p:
+    name: "Ambient MLB"
+    location: "Logic Board"
+
+fans:
+  Main:
+    name: "Main Chassis Fan"
+    hysterisis: 0.02

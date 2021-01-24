@@ -1,0 +1,369 @@
+#!/bin/env python
+
+import glob
+import time
+import sys
+import argparse
+import atexit
+
+# Fan hysteresis, default to 5%
+FAN_HYSTERISIS = .02
+
+HIGH_TEMP_COEFFICIENT = 1.2    # How much of are we going to accelerate once we've hit the high temp region.
+HEAT_DECAY_COEFFICIENT = .80   # Heating efficiency of the chassis, this can be used as a scaling factor for the whole heat_decay number.
+
+AMBIENT_HEAT_DECAY_WEIGHT = .10
+
+class SensorDef:
+    VALID_MAX = 110  # Anything higher than 110 is too crazy to be real.
+    VALID_MIN = 5  # Anything lower than 5 is too crazy to be real.
+
+    def __repr__(self):
+        return self.name
+
+    def __init__(self, name, description, location,
+                 thresh_idle=55, thresh_high=75, thresh_crit=90, defined=True,
+                 active=True, ambient=False):
+
+        self.name = name
+        self.description = description
+        self.location = location
+        self.defined = defined  # This sensor definition was defined by a programmer
+
+        self.active = active  # This sensor definition contributes to fan calculations
+        self.ambient = ambient
+
+        self.thresh_high = thresh_high  # Anything higher will trigger a more aggressive correction.
+        self.thresh_crit = thresh_crit  # Critical temperature will trigger a full fan speed.
+        self.thresh_idle = thresh_idle  # Anything below this won't trigger any fan changes.
+
+        self.range_high = self.thresh_high - self.thresh_idle # Range for the idle->high interval
+        self.range_crit = self.thresh_crit - self.thresh_high # Range for the high->critical interval
+
+        self.range_scale_crit = None
+        self.range_scale_high = None
+
+        self.sensor_path = None
+        self.last_val = None
+
+        self.avg_total = 0.0
+        self.avg_poll_count = 0.0
+
+        self.high_mark = 0.0
+        self.low_mark = sys.maxsize
+
+        self.proportional = 0.0
+        self.integral = 0.0
+        self.derivative = 0.0
+
+    def poll(self) -> float:
+        cur_temp = getSensorTemp(self.sensor_path)
+        self.avg_total += cur_temp
+        self.avg_poll_count += 1
+
+        if cur_temp < self.low_mark: self.low_mark = cur_temp
+        if cur_temp > self.high_mark: self.high_mark = cur_temp
+
+        self.last_val = cur_temp
+        return self.last_val
+
+    def is_valid(self) -> bool:
+        current_temp = getSensorTemp(self.sensor_path)
+        return self.VALID_MIN < current_temp < self.VALID_MAX
+
+    def print_stats(self):
+        stats_str = f"{self.last_val} {self.name} ({self.description})  avg: {round(self.avg_total / self.avg_poll_count, 2)}, max: {round(self.high_mark, 2)}, min: {round(self.low_mark, 2)}"
+        return stats_str
+
+    def calculate_score(self) -> float:
+        if self.last_val < self.thresh_idle: return 0.0  # Return no heat on idle.
+        if self.last_val > self.thresh_crit: return 1.0  # Return max if we've hit critical
+        else:
+            relative_heat = (self.last_val - self.thresh_idle) / (self.thresh_crit - self.thresh_idle)
+
+            if relative_heat > self.thresh_high:
+                relative_heat = relative_heat / self.range_scale_crit
+                relative_heat = relative_heat * HIGH_TEMP_COEFFICIENT
+
+            return relative_heat / self.range_scale_high
+
+MP61_BLACKLIST = ("TA0P",  ## Duplicates
+                  "TA1P",
+                  "TA2P",
+                  "TC0P",
+                  "TC1P",
+                  "Te0t",
+                  "TG0D",
+                  "TG0M",
+                  "TG0P",
+                  "TG0R",
+                  "TG1D",
+                  "TG0R",
+                  "TG1D",
+                  "TG1M",
+                  "TG1P",
+                  "TG1R",
+                  "TI1P",
+                  "TH0A",
+                  "TH0B",
+                  "TH0C",
+                  "TI0P",
+                  "TI0T",
+                  "Tm0P",
+                  "TM0P",
+                  "TM1P",
+                  "Tp0T",
+                  "TM1R",
+                  "TPCD",
+                  "TM0R")
+
+MP61_KNOWN_SENSORS = [SensorDef("TA0p", "Ambient MLB", "Logic Board", thresh_idle=20, thresh_high=30, thresh_crit=40,
+                                ambient=True),
+
+                      SensorDef("TA1p", "Ambient 2", "Logic Board", thresh_idle=20, thresh_high=30, thresh_crit=40,
+                                ambient=True, active=False),
+                      SensorDef("TA2p", "Ambient 3", "Logic Board", thresh_idle=20, thresh_high=30, thresh_crit=40,
+                                ambient=True, active=False),
+
+                      SensorDef("TC0p", "CPU Proximity 0", "CPU Riser Card"),
+                      SensorDef("TC1p", "CPU VCC VR Proximity", "CPU Riser Card"),
+                      SensorDef("TCXr", "Te0t CPU Relative Die Sensor", "CPU Riser Card"),
+                      SensorDef("Te0T", "PCIe Switch Diode", "I/O Board", thresh_idle=70, thresh_high=85, thresh_crit=90),  # This runs hot for some reason
+                      SensorDef("TG0d", "GFXA Die Diode", "Graphics Board A"),
+                      SensorDef("TG0p", "GFXA GPU Proximity", "Graphics Board A"),
+                      SensorDef("TG0r", "GFXA VR Proximity", "Graphics Board A"),
+                      SensorDef("TG1d", "GFXB Die Diode", "Graphics Board B"),
+                      SensorDef("TG1p", "GFXB GPU Proximity", "Graphics Board B"),
+                      SensorDef("TG1r", "GFXB VR Proximity", "Graphics Board B"),
+                      SensorDef("TI0p", "I/O Board Proximity", "I/O Board"),
+                      SensorDef("TI0t", "Right Rear AB Thermal Diode", "I/O Board"),
+                      SensorDef("TI1p", "5V/3V3 VR Proximity", "I/O Board"),
+                      SensorDef("TM0p", "CPU SO-DIMM Proximity", "CPU Riser Card"),
+                      SensorDef("Tm0p", "MLB Proximity", "Logic Board"),
+                      SensorDef("TM0r", "CPU DIMM_01 VR Proximity", "CPU Riser Card"),
+                      SensorDef("TM1p", "CPU DIMM_23 top Proximity", "CPU Riser Card"),
+                      SensorDef("TM1r", "CPU DIMM_23 VR Proximity", "CPU Riser Card"),
+                      SensorDef("Tp0t", "PSU Secondary H/S Temp Diode", "Power Supply"),
+
+                      SensorDef("TC0c", "CPU Core 0", "CPU Package"),  # Extrapolated from testing and other models
+                      SensorDef("TC1c", "CPU Core 1", "CPU Package"),  # Extrapolated from testing and other models
+                      SensorDef("TC2c", "CPU Core 2", "CPU Package"),  # Extrapolated from testing and other models
+                      SensorDef("TC3c", "CPU Core 3", "CPU Package"),  # Extrapolated from testing and other models
+                      SensorDef("TCXc", "PECI CPU", "CPU Package"),
+                      SensorDef("TCSc", "PECI System Agent", "CPU Package"),
+                      SensorDef("TPCd", "PCH Die", "Logic Board", thresh_idle=55),
+
+                      SensorDef("TG0E", "Filtered GPU 0 Die", "Graphics Board A"),
+                      SensorDef("TG0F", "Filtered GPU 0 Die (Control)", "Graphics Board A"),
+                      SensorDef("TG0m", "Memory", "Graphics Board A"),
+
+                      SensorDef("TG1E", "Filtered GPU 1 Die", "Graphics Board B"),
+                      SensorDef("TG1F", "Filtered GPU 1 Die (Control)", "Graphics Board B"),
+                      SensorDef("TG1m", "Memory", "Graphics Board B"),
+
+                      SensorDef("TH0a", "SSD A", "SSD Card"),
+                      SensorDef("TH0b", "SSD B", "SSD Card"),
+                      SensorDef("TH0c", "Unknown", "SSD Card"),
+                      SensorDef("TH0V", "Unknown", "SSD Card"),
+
+                      # These sensors tend to change a lot and give irrealistic temperatures
+                      SensorDef("TM1a", "DIMM virtual temp", "Memory", active=False),
+                      SensorDef("TM2a", "DIMM virtual temp", "Memory", active=False),
+                      SensorDef("TM3a", "DIMM virtual temp", "Memory", active=False),
+                      SensorDef("TM2b", "DIMM virtual temp", "Memory", active=False),
+                      SensorDef("TM3b", "DIMM virtual temp", "Memory", active=False),
+                      SensorDef("TM4b", "DIMM virtual temp", "Memory", active=False),
+                      SensorDef("TMXP", "DIMM Proximity max cooked temp", "Memory"),
+
+                      SensorDef("TM2c", "DIMM virtual temp", "Memory"),
+                      SensorDef("TM2f", "Unknown Sensor", "Memory"),
+                      SensorDef("TM2e", "Unknown Sensor", "Memory"),
+                      SensorDef("TM0V", "Synthetic DIMM Estimate", "Memory"),
+                      SensorDef("TA0V", "Virtual Ambient Temp 1", "Logic Board",
+                                thresh_idle=20, thresh_high=30, thresh_crit=40, ambient=True),
+                      SensorDef("TS0V", "Synthetic bottom skin", "Unknown location", active=False),
+
+                      SensorDef("Tp0F", "Filtered PSU (Control)", "Power Supply")
+                      ]
+
+class Fan:
+    def __init__(self, fanNo):
+        self.fanNo = fanNo
+
+        self.label = ""
+        self.speed = 0
+        self.speed_min = 0
+        self.speed_max = 0
+
+        self.resync_counter = 0
+
+    def _readFile(self, suffix: str):
+        with open(f"/sys/devices/platform/applesmc.768/fan{self.fanNo}_{suffix}") as fp:
+            return fp.read()
+
+    def readInitial(self):
+        self.label = self._readFile("label")
+        self.speed_min = int(self._readFile("min"))
+        self.speed_max = int(self._readFile("max"))
+        atexit.register(self.restoreManual)
+
+    def __repr__(self):
+        return f"<Fan:{self.label}>"
+
+    def restoreManual(self):
+        self.setManual(False)
+
+    def setManual(self, state: bool):
+        with open(f"/sys/devices/platform/applesmc.768/fan{self.fanNo}_manual", "w") as fp:
+            print(int(state), file=fp)
+
+    def getCurrentSpeed(self):
+        self.speed =  int(self._readFile("input"))
+        return self.speed
+
+    def getThrottle(self):
+        return  max((self.speed - self.speed_min) / (self.speed_max - self.speed_min), 0)
+
+    def setThrotle(self, throttle: float):
+        self.setSpeed(int(throttle*(self.speed_max - self.speed_min)+self.speed_min))
+
+    def setSpeed(self, rpm: int):
+
+        # Get thr speed every 20 speed adjustments
+        self.resync_counter += 1
+
+        if self.resync_counter > 10:
+            self.getCurrentSpeed()
+            self.resync_counter = 0
+
+        rpm = min(self.speed_max, max(self.speed_min, rpm))
+        with open(f"/sys/devices/platform/applesmc.768/fan{self.fanNo}_output", "w") as fp:
+            print(rpm, file=fp)
+
+        self.speed = rpm
+
+
+def getSensorDef(label):
+    for s_def in tuple(MP61_KNOWN_SENSORS):
+        if label == s_def.name:
+            MP61_KNOWN_SENSORS.remove(s_def)
+            return s_def
+
+
+def getSensorTemp(sensor_path):
+    with open(sensor_path, "r") as fp:
+        raw_val = float(fp.read().strip())
+    return raw_val / 1000
+
+
+def main(args):
+    print("Oscar - MacPro 6,1 fan controller")
+
+    fan = Fan(1)
+    fan.readInitial()
+    fan.setManual(True)
+    sensors = []
+
+    avg_high_range = 0.0
+    avg_crit_range = 0.0
+
+    # Scan and build sensor structures
+    for labelFn in glob.glob("/sys/devices/platform/applesmc.768/temp*_label"):
+        with open(labelFn, "r") as fp:
+            s_label = fp.read().strip()
+
+        if s_label in MP61_BLACKLIST:
+            # print(f"Blacklisted sensor {s_label}")
+            continue
+
+        sensor = getSensorDef(s_label)
+        input_fn = labelFn.replace("_label", "_input")
+
+        if sensor is None:
+            sensor = SensorDef(s_label, "Unknown sensor", "Unknown location", defined=False, active=False)
+            if args.verbose:
+                print(
+                    f"Undefined sensor {s_label} in {input_fn}, sensor will be monitored but won't be used for fan control",
+                    file=sys.stderr)
+
+        sensor.sensor_path = input_fn
+        sensor.poll()
+
+        if sensor.is_valid():
+            sensors.append(sensor)
+            avg_crit_range += sensor.range_crit
+            avg_high_range += sensor.range_high
+
+        else:
+            if args.verbose:
+                print(f"Disqualifying {sensor.name} for invalid temperature {sensor.last_val}")
+
+    sensors.sort(key=lambda s: s.name.lower())
+
+    avg_high_range = avg_high_range / len(sensors)
+    avg_crit_range = avg_crit_range / len(sensors)
+
+    for sensor in sensors:
+        sensor.range_scale_crit = sensor.range_crit / avg_crit_range
+        sensor.range_scale_high = sensor.range_high / avg_high_range
+
+    if args.verbose:
+        for sensor in sensors:
+            print(
+                f"{sensor.name} {sensor.description} dynamic: {not sensor.defined} -- {sensor.last_val} ")
+
+    for sensor in MP61_KNOWN_SENSORS:
+        print(f"Warning: Unclaimed sensor {sensor}", sys.stderr)
+
+    lead_chassis_sensor = None  # Hottest sensor, to be used for correction calculation
+    lead_ambient_sensor = None
+    fan.getCurrentSpeed()
+
+    while True:
+        heat_in_system = -1.0
+        heat_in_ambient = -1.0
+
+        for sensor in sensors:
+            sensor.poll()
+            s_score = sensor.calculate_score()
+
+            # Find the hottest point in the system
+            if sensor.active and not sensor.ambient: # Find the hottest active sensor
+                if s_score > heat_in_system:
+                    lead_chassis_sensor = sensor
+                    heat_in_system = s_score
+
+            # Find the warmest ambient temperature
+            elif sensor.active and sensor.ambient:
+                if s_score > heat_in_ambient:
+                    heat_in_ambient = s_score
+                    lead_ambient_sensor = sensor
+
+        cur_throttle = fan.getThrottle()
+
+        heat_decay = (cur_throttle * ( 1 - heat_in_system)) * HEAT_DECAY_COEFFICIENT
+        proposed_throttle = heat_in_system - heat_decay
+        delta_throttle = proposed_throttle - cur_throttle
+
+        if abs(delta_throttle) > 0.05:
+            fan.setThrotle(proposed_throttle)
+
+            if args.verbose:
+                print("====== Fan speed change ======")
+                print(f"Ambient Sensor: {lead_ambient_sensor.description} on {lead_ambient_sensor.location} ({lead_ambient_sensor.last_val} degC)")
+                print(f"Triggered by: {lead_chassis_sensor.description} on {lead_chassis_sensor.location} ({lead_chassis_sensor.last_val} degC)")
+                print(f"Throttle: cur: {round(proposed_throttle, 3)} ({fan.speed} rpm) delta: {round(delta_throttle,3)}")
+                print(f"Variables; ")
+                print(f"\theat_decay={round(heat_decay, 3)}")
+                print(f"\theat_in_system={round(heat_in_system,3)}")
+                print(f"\theat_in_ambient={round(heat_in_ambient, 3)}")
+                print()
+
+        time.sleep(1)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Monitor temperatures and control fan on MacPro 6,1")
+    parser.add_argument("-v", '--verbose', help='Display verbose output', action="store_true", default=False)
+
+    args = parser.parse_args()
+    main(args)

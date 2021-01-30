@@ -1,15 +1,160 @@
+# Config file to Apple Mac Pro
 
 ## Globals section
 global:
-    high_temp_coefficient: 1.2     # Coefficient used when a sensor hits the high range.
-    head_decay_coefficient: .8     #
+  poll_time: 1
+
+## Temp ranges referenced by sensors.
+temp-ranges:
+  default:
+    idle: 55
+    high: 70
+    critical: 85
+
+  # Used to score ambient temps so we can compensate for ambient changes
+  ambient:
+    idle: 0
+    high: 30
+    critical: 45
+
+  # PCIe switch runs hotter than normal on this workstation
+  pci-switch:
+    idle: 65
+    high: 75
+    critical: 85
+
+  # CPU package is going to have it's own limits
+  cpu:
+    idle: 50
+    high: 75
+    critical: 85
 
 sensors:
-  TA0p:
-    name: "Ambient MLB"
-    location: "Logic Board"
+  io-board:
+    description: "I/O Board"
+    Te0T:
+      name: "PCIe Switch diode"
+      range: pci-switch
+    TI0p:
+      name: "Proximity"
+    TI0t:
+      name: "Right Rear AB Thermal Diode"
+    TI1p:
+      name: "5V/3V3 VR Proximity"
+    Tm0p:
+      name: "Proximity"
+
+  logic-board:
+    description: "Logic Board"
+    TA0p:
+      name: "Ambient MLB"
+      range: ambient
+    TA1p:
+      name: "Ambient 2"
+      enabled: false
+    TA2p:
+      name: "Ambient 3"
+      enabled: false
+    TA0V:
+      name: "Virtual Ambient"
+      range: ambient
+    TPCd:
+      name: "PCH Die"
+
+  cpu-riser-card:
+    description: "CPU Riser Card"
+    TC0p:
+      name: "CPU Proximity 0"
+    TC1p:
+      name: "PU VCC VR Proximity"
+    TCXr:
+      name: "CPU Relative Die Sensor"
+    TM0p:
+      name: "DIMM_01 Proximity"
+    TM0r:
+      name: "DIMM_01 Virtual"
+    TM1p:
+      name: "DIMM_23 Proximity"
+    TM1r:
+      name: "DIMM_23 Virtual"
+
+    TM2f:
+      name: "Memory Fan Control"
+
+  cpu-package:
+    description: "CPU Package"
+    range: cpu
+    TC0c:
+      name: "Core 0"
+    TC1c:
+      name: "Core 1"
+    TC2c:
+      name: "Core 2"
+    TC3c:
+      name: "Core 3"
+    TCXc:
+      name: "PECI CPU"
+    TCSc:
+      name: "PECI System Agent"
+
+  gpu-a:
+    description: "GPU A"
+    TG0d:
+      name: "Die Diode"
+    TG0p:
+      name: "GPU Proximity"
+    TG0r:
+      name: "VR Proximity"
+    TG0m:
+      name: "Memory"
+    TG0E:
+      name: "Die Filtered"
+    TG0F:
+      name: "Fan Control"
+
+  gpu-b:
+    description: "GPU B"
+    TG1d:
+      name: "Die Diode"
+    TG1p:
+      name: "GPU Proximity"
+    TG1r:
+      name: "VR Proximity"
+    TG1m:
+      name: "Memory"
+    TG1E:
+      name: "Die Filtered"
+    TG1F:
+      name: "Fan Control"
+
+  psu:
+    description: "Power Supply"
+    Tp0t:
+      name: "Secondary H/S Temp Diode"
+    Tp0F:
+      name: "Filtered"
+
+  ssd:
+    description: "SSD"
+    TH0a:
+      name: "Sensor A"
+    TH0b:
+      name: "Sensor B"
+    TH0c:
+      name: "Sensor C"
+    TH0V:
+      name: "Virtual"
+
+  exterior:
+    description: ""
+    range: ambient
+    TS0V:
+      name: "Synthetic Bottom Skin"
 
 fans:
   Main:
-    name: "Main Chassis Fan"
-    hysterisis: 0.02
+    description: "Main fan"
+    hysteresis: 0.02
+
+    ambient: [TA0p]
+    internal: [Tm0p, TPCd, Te0T, TC0c, TC1c, TC2c, TC3c, TCXc, TCSc, TG0F, TG0m, TG1F, TG1m, Tp0t]

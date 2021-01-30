@@ -1,0 +1,14 @@
+[Unit]
+Description=A fan manager daemon for MacPro trashcans
+After=sysinit.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/oscar
+ExecReload=/usr/bin/kill -HUP $MAINPID
+PIDFile=/var/run/mbpfan.pid
+Restart=always
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=sysinit.target

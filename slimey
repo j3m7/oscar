@@ -1,0 +1,87 @@
+#!/bin/env python
+
+import sys
+import argparse
+import pathlib
+
+SMC_PATH = pathlib.Path("/sys/devices/platform/applesmc.768")
+
+def getSensorTemp(sensor_path):
+    with open(sensor_path, "r") as fp:
+        raw_val = float(fp.read().strip())
+    return raw_val / 1000
+
+
+def checkRequirements():
+    if sys.platform != "linux":
+        print("CRITICAL: This runs on linux only")
+        sys.exit(1)
+
+    if not SMC_PATH.exists():
+        print(f"CRITICAL: Apple SMC Directory not found on {SMC_PATH}, is the applesmc module loaded?")
+        sys.exit(1)
+
+
+def main(args):
+    GUESS_SUBSYS_LOOKUP = {"g": "GFX",
+                           "c": "CPU",
+                           "m": "Memory",
+                           "i": "I/O Board",
+                           "h": "Storage",
+                           "p": "PCH",
+                           "a": "Ambient",
+                           "f": "Fan",
+                           's': "Expansion Slot"}
+
+    GUESS_SENSOR_TYPE_2 = {
+        "r": "Relative",
+        "d": "Diode",
+        "x": "PECI",
+    }
+
+    GUESS_SENSOR_TYPE_3 = {
+        "r": "Relative",
+        't': "Trend",
+        "m": "Memory",
+        "d": "Die",
+        "f": "Fan Control",
+        "c": "Cooked",
+        "j": "Max Error",
+        "v": "Virtual",
+        'p': "Proximity",
+        'e': "Filtered"
+    }
+
+    # Iterate through fans
+    for label_fn in SMC_PATH.glob("fan*_label"):
+        with open(label_fn) as fp:
+            fan_label = fp.read().strip()
+
+        fan_index = int(label_fn.name.lstrip("fan").rstrip("_label"))
+    sensors = []
+    for label_fn in SMC_PATH.glob("temp*_label"):
+        with open(label_fn) as fp:
+            sensor_label = fp.read().strip()
+
+        sensor_index = int(label_fn.name.lstrip("temp").rstrip("_label"))
+        sensor_path = SMC_PATH / f"temp{sensor_index}_input"
+        location_name = GUESS_SUBSYS_LOOKUP.get(sensor_label[1].lower())
+        definition_index = GUESS_SENSOR_TYPE_2.get(sensor_label[2].lower(), sensor_label[2])
+        sensor_descr = GUESS_SENSOR_TYPE_3.get(sensor_label[3].lower(), sensor_label[3])
+        sensor_temp = getSensorTemp(sensor_path)
+        if sensor_temp != -127.0:
+            sensors.append(f"{sensor_label} {round(sensor_temp,2)} Guess: {sensor_descr} {definition_index} on {location_name}")
+    sensors.sort(key=lambda x:x.lower())
+
+    for s in sensors: print(s)
+
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="Monitor temperatures and control fan on MacPro 6,1")
+    parser.add_argument("-v", '--verbose', help='Display verbose output', action="store_true", default=False)
+
+    args = parser.parse_args()
+
+    checkRequirements()
+    main(args)

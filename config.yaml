@@ -33,6 +33,7 @@ sensors:
   io-board:
     description: "I/O Board"
     Te0T:
+      # This diode runs really hot on this machine even though the component's max operating temp is 70 degC
       name: "PCIe Switch diode"
       range: pci-switch
     TI0p:

@@ -23,10 +23,8 @@ def debug(msg: str) -> None:
 def info(msg: str) -> None:
     print("INFO:", msg)
 
-
 def warn(msg: str):
     print("WARN:", msg, file=sys.stderr)
-
 
 def error(msg: str):
     print("ERROR:", msg, file=sys.stderr)
@@ -177,7 +175,7 @@ class Fan:
         if register_callback:
             if state:
                 debug(f"Registered {self.label} fan control restore callback")
-                atexit.register(self.setManual, (False), {register_callback: False})
+                atexit.register(self.setManual, False, {register_callback: False})
             else:
                 atexit.unregister(self.setManual)
 
@@ -264,7 +262,19 @@ class Config:
         for name, section in self.config.get("fans").items():
             Fan.fromConfigSection(self, name, section)
 
-    def configureSysfs(self):
+    def validate(self):
+        """\
+        Check that loaded configuration has a chance of working.
+        """
+        for name, fan in self.fans.items():
+            if len(fan.internalSensors) == 0:
+                error(f"Fan {name} is defined but no internal sensors associated with it. Refusing to start")
+
+        for name, sensor in self.sensors.items():
+            if not sensor.fans:
+                debug(f"Unused sensor {name}")
+
+    def read_sysfs(self):
         """\
         Read sensors data from the smc directory in SysFS and apply definitions to it.
         """
@@ -287,8 +297,7 @@ class Config:
         for name, sensor in self.sensors.items():
             if sensor.path is None:
                 warn(f"Unconfigured sensor {name}")
-            if not sensor.fans:
-                warn(f"Unused sensor {name}")
+
 
         for label_fn in SMC_PATH.glob("fan*_label"):
             with open(label_fn) as fp:
@@ -335,9 +344,10 @@ def main(args):
     with open(args.config, "r") as fp:
         config.parse(fp)
 
-    config.configureSysfs()
+    config.read_sysfs()
+    config.validate()
 
-    createPidFile('/var/run/oscar.pid')
+    createPidFile(args.pid)
 
     for name, fan in config.fans.items():
         debug(f"Disabling firmware control on {name} Fan")
@@ -347,6 +357,8 @@ def main(args):
     run_loop(config)
 
 def run_loop(config):
+    info(f"Starting control loop with {len(config.fans)} fans and {len(config.sensors)} sensors")
+
     while True:
         # Get the data from all the sensors
         for name, sensor in config.sensors.items():
@@ -356,21 +368,25 @@ def run_loop(config):
             fan.internalSensors.sort(key=lambda s: s.score(), reverse=True)
             fan.ambientSensors.sort(key=lambda s: s.score(), reverse=True)
 
-            internalSensor: Sensor = fan.internalSensors[0]
+            lead_sensor: Sensor = fan.internalSensors[0]
 
-            heat_in_system = internalSensor.score()
-            heat_decay = fan.getThrottle() * (1 - heat_in_system)
+            ambient_sensor = fan.ambientSensors[0]
+            ambient_ratio = ambient_sensor.last_val / lead_sensor.last_val
 
+            # How much heat is in the system.
+            heat_in_system = lead_sensor.score()
+
+            # How much heat can we move out.
+            heat_decay = (ambient_ratio * fan.getThrottle()) * (1 - heat_in_system)
             corrected_throttle = heat_in_system - heat_decay
             delta_throttle = corrected_throttle - fan.getThrottle()
 
-
             if abs(delta_throttle) > fan.hysteresis:
                 fan.setThrotle(corrected_throttle)
-                ambientSensors = fan.ambientSensors[0]
+
                 debug(
-                    f"Lead sensor {internalSensor.name} located on {internalSensor.location.description} ({internalSensor.label})")
-                debug(f"Load sensor temp: {internalSensor.last_val} degC")
+                    f"Lead sensor {lead_sensor.name} - {lead_sensor.location.description} ({lead_sensor.label})")
+                debug(f"Load sensor temp: {lead_sensor.last_val} degC")
 
                 debug(f"Throttle correction for {name} {round(delta_throttle, 3)} ({fan.getCurrentSpeed()} RPM)")
 
@@ -381,6 +397,7 @@ if __name__ == "__main__":
 
     parser.add_argument("-v", '--verbose', help='Display verbose output', action="store_true", default=False)
     parser.add_argument("-c", "--config", help="Config file to read", default="/etc/oscar.yaml")
+    parser.add_argument("-p", "--pid", help="PID File", default="/run/oscar.pid")
 
     subparsers = parser.add_subparsers()
 
